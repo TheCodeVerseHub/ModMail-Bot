@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Environment Variables
+.env
+
+# Logs
+*.log
+
+# Database
+*.db
+*.sqlite3
+data/modmail_sessions.json
+
+# OS
+.DS_Store
