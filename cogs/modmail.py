@@ -5,7 +5,7 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 from utils.config import Config
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union
 import asyncio
 import json
 from pathlib import Path
@@ -29,6 +29,10 @@ class ModMail(commands.Cog):
         self.modmail_channel_id: Optional[int] = getattr(config, 'modmail_channel_id', None)
         # Configurable reset delay (seconds)
         self.RESET_DELAY_SECONDS: int = getattr(config, 'modmail_reset_seconds', 600)
+        # Rate limit mitigation: Global DM throttle (max 2 concurrent DMs)
+        self._dm_semaphore: asyncio.Semaphore = asyncio.Semaphore(2)
+        # Cache DM channels to avoid repeated create_dm() API calls
+        self._dm_channel_cache: Dict[int, discord.DMChannel] = {}
         # Load persisted sessions if present
         try:
             self._load_sessions_from_file()
@@ -50,6 +54,23 @@ class ModMail(commands.Cog):
                     raise
             except Exception:
                 raise
+    
+    async def _send_dm_safe(self, user: Union[discord.User, discord.Member], **kwargs):
+        """Send DM with global throttle and channel caching to reduce rate limits."""
+        # Use semaphore to limit concurrent DM sends (prevents rate limit bursts)
+        async with self._dm_semaphore:
+            # Reuse cached DM channel to avoid create_dm() API calls
+            dm_channel = self._dm_channel_cache.get(user.id)
+            if dm_channel is None:
+                # Get or create DM channel and cache it
+                if isinstance(user, discord.Member):
+                    actual_user = user._user
+                else:
+                    actual_user = user
+                dm_channel = await actual_user.create_dm()
+                self._dm_channel_cache[user.id] = dm_channel
+            
+            return await self._send_with_retry(dm_channel.send, **kwargs)
 
     # Persistence helpers
     def _load_sessions_from_file(self):
@@ -86,8 +107,10 @@ class ModMail(commands.Cog):
             self.message_content = message_content
 
         async def on_timeout(self):
-            # Reset session if no action in 10 minutes
-            self.cog.modmail_sessions.pop(self.user.id, None)
+            # Safety: Move to resolved state with delayed reset instead of clearing session
+            # This prevents users from being locked out if they don't respond quickly
+            reset_at = (datetime.utcnow() + timedelta(seconds=self.cog.RESET_DELAY_SECONDS)).isoformat()
+            self.cog.modmail_sessions[self.user.id] = {'state': 'resolved', 'reset_at': reset_at}
             try:
                 self.cog._persist_sessions_to_file()
             except Exception:
@@ -119,6 +142,7 @@ class ModMail(commands.Cog):
             except discord.errors.HTTPException as e:
                 if e.status == 429:
                     logger.error(f"modmail: rate limited on confirm button for {self.user.id}")
+                    # Graceful degradation: inform user without crashing
                     try:
                         await interaction.response.send_message("The bot is being rate limited. Please try again in a minute.", ephemeral=True)
                     except:
@@ -198,7 +222,7 @@ class ModMail(commands.Cog):
                     color=discord.Color.blue()
                 )
                 embed.set_footer(text="Please follow these guidelines to help moderators assist you faster")
-                await self._send_with_retry(message.author.send, embed=embed)
+                await self._send_dm_safe(message.author, embed=embed)
                 self.modmail_sessions[user_id] = {'state': 'open', 'reset_at': None}
                 logger.info(f"modmail: guidelines sent to user {user_id}")
                 try:
@@ -215,7 +239,7 @@ class ModMail(commands.Cog):
                     color=discord.Color.orange()
                 )
                 view = self.ConfirmView(self, message.author, message.content)
-                await self._send_with_retry(message.author.send, embed=embed, view=view)
+                await self._send_dm_safe(message.author, embed=embed, view=view)
                 logger.info(f"modmail: confirmation requested for user {user_id} (within reset window)")
                 return
 
@@ -226,7 +250,7 @@ class ModMail(commands.Cog):
                     color=discord.Color.orange()
                 )
                 view = self.ConfirmView(self, message.author, message.content)
-                await self._send_with_retry(message.author.send, embed=embed, view=view)
+                await self._send_dm_safe(message.author, embed=embed, view=view)
                 logger.info(f"modmail: confirmation requested for user {user_id}")
                 return
 
@@ -237,7 +261,7 @@ class ModMail(commands.Cog):
                         description="Your modmail is currently locked. Please wait for a moderator to reply before sending more messages.",
                         color=discord.Color.orange()
                     )
-                    await self._send_with_retry(message.author.send, embed=locked_embed)
+                    await self._send_dm_safe(message.author, embed=locked_embed)
                 except Exception:
                     pass
                 return
@@ -251,12 +275,13 @@ class ModMail(commands.Cog):
             await ctx.send("User not found or not cached.")
             return
         try:
+            # Merge reply + session info into ONE embed to reduce DM rate limits
             reply_embed = discord.Embed(
                 title="Moderator Reply",
-                description=response + "Your session is now resolved and open if you have any further queries. This session will reset after a short period of inactivity.",
+                description=response,
                 color=discord.Color.green()
             )
-            # include moderator identity
+            # Include moderator identity
             try:
                 avatar_url = None
                 if hasattr(ctx.author, 'display_avatar') and getattr(ctx.author, 'display_avatar'):
@@ -265,20 +290,17 @@ class ModMail(commands.Cog):
             except Exception:
                 pass
             
-            # Use retry logic for sending DM
-            await self._send_with_retry(user.send, embed=reply_embed)
+            # Add session status as footer instead of separate message
+            reply_embed.set_footer(text="Your session is now open. If you need to send another message, you may do so. This session will reset after a short period of inactivity.")
+            
+            # Send ONE DM instead of two (critical rate limit reduction)
+            await self._send_dm_safe(user, embed=reply_embed)
             await ctx.send("Reply sent.")
             
-            # Schedule reset in the future instead of immediately opening the session
+            # Schedule reset in the future
             reset_at = (datetime.utcnow() + timedelta(seconds=self.RESET_DELAY_SECONDS)).isoformat()
             self.modmail_sessions[user_id] = {'state': 'resolved', 'reset_at': reset_at}
             logger.info(f"modmail: scheduled reset for user {user_id} at {reset_at}")
-            info_embed = discord.Embed(
-                title="You may send another message only if needed",
-                description="A Moderator has responded. If you need to send another message your session is open. This session will reset after a short period of inactivity.",
-                color=discord.Color.blue()
-            )
-            await self._send_with_retry(user.send, embed=info_embed)
             try:
                 self._persist_sessions_to_file()
             except Exception:
@@ -294,15 +316,17 @@ class ModMail(commands.Cog):
                     )
                     await self._send_with_retry(channel.send, embed=embed)
         except discord.errors.HTTPException as e:
+            # Graceful error handling: inform moderator without crashing
             if e.status == 429:
-                await ctx.send("The bot is being rate limited. Please wait a minute and try again.")
+                await ctx.send("⚠️ Bot is rate limited. Please wait 1-2 minutes before replying again. The session remains locked.")
+                logger.error(f"modmail: persistent rate limit in reply_modmail for user {user_id}")
             elif e.code == 50007:  # Cannot send messages to this user
-                await ctx.send("Failed to send DM. User may have DMs closed.")
+                await ctx.send("❌ Failed to send DM. User may have DMs closed.")
             else:
-                await ctx.send(f"Failed to send message: {str(e)}")
+                await ctx.send(f"❌ Failed to send message: {str(e)}")
         except Exception as e:
             logger.exception(f"modmail: error in reply_modmail for user {user_id}")
-            await ctx.send(f"An error occurred: {str(e)}")
+            await ctx.send(f"❌ An error occurred: {str(e)}")
 
     @commands.command(name="set_modmail_channel")
     @commands.has_permissions(administrator=True)
@@ -328,7 +352,7 @@ class ModMail(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         
         try:
-            # Send moderator reply as an embed to the user
+            # Merge reply + session info into ONE embed to reduce DM rate limits
             reply_embed = discord.Embed(
                 title="Moderator Reply",
                 description=response,
@@ -342,19 +366,15 @@ class ModMail(commands.Cog):
             except Exception:
                 pass
             
-            # Use retry logic for sending DM
-            await self._send_with_retry(user.send, embed=reply_embed)
+            # Add session status as footer instead of separate message
+            reply_embed.set_footer(text="Your session is now open. If you need to send another message, you may do so. This session will reset after a short period of inactivity.")
+            
+            # Send ONE DM instead of two (critical rate limit reduction)
+            await self._send_dm_safe(user, embed=reply_embed)
             
             reset_at = (datetime.utcnow() + timedelta(seconds=self.RESET_DELAY_SECONDS)).isoformat()
             self.modmail_sessions[user.id] = {'state': 'resolved', 'reset_at': reset_at}
             logger.info(f"modmail: scheduled reset for user {user.id} at {reset_at}")
-            
-            info_embed = discord.Embed(
-                title="You may send another message soon",
-                description="A moderator has responded. If you need to send another message, your session is open. This session will reset after a short period of inactivity.",
-                color=discord.Color.blue()
-            )
-            await self._send_with_retry(user.send, embed=info_embed)
             
             try:
                 self._persist_sessions_to_file()
@@ -376,16 +396,18 @@ class ModMail(commands.Cog):
             await interaction.followup.send("Reply sent.", ephemeral=True)
             
         except discord.errors.HTTPException as e:
+            # Graceful error handling: inform moderator without crashing
             if e.status == 429:
-                await interaction.followup.send("The bot is being rate limited. Please wait a minute and try again.", ephemeral=True)
+                await interaction.followup.send("⚠️ Bot is rate limited. Please wait 1-2 minutes before replying again. The session remains locked.", ephemeral=True)
+                logger.error(f"modmail: persistent rate limit in reply_modmail_slash for user {user.id}")
             elif e.code == 50007:  # Cannot send messages to this user
-                await interaction.followup.send("Failed to send DM. User may have DMs closed.", ephemeral=True)
+                await interaction.followup.send("❌ Failed to send DM. User may have DMs closed.", ephemeral=True)
             else:
-                await interaction.followup.send(f"Failed to send message: {str(e)}", ephemeral=True)
+                await interaction.followup.send(f"❌ Failed to send message: {str(e)}", ephemeral=True)
         except Exception as e:
             logger.exception(f"modmail: error in reply_modmail_slash for user {user.id}")
             try:
-                await interaction.followup.send(f"An error occurred: {str(e)}", ephemeral=True)
+                await interaction.followup.send(f"❌ An error occurred: {str(e)}", ephemeral=True)
             except:
                 pass
 
