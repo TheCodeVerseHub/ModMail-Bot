@@ -32,21 +32,28 @@ class ModMailBot(commands.Bot):
         intents.presences = True
 
         super().__init__(
-            command_prefix='!',
+            command_prefix='m!',
             intents=intents,
-            help_command=None
+            help_command=None,
+            owner_id=config.owner_id
         )
 
         self.config = config
 
     async def setup_hook(self) -> None:
         """Setup hook called before the bot starts."""
-        # Load modmail cog
-        try:
-            await self.load_extension('cogs.modmail')
-            logger.info('Loaded cogs.modmail')
-        except Exception as e:
-            logger.error(f'Failed to load cogs.modmail: {e}')
+        # Load all cogs
+        if os.path.exists('./cogs'):
+            for filename in os.listdir('./cogs'):
+                if filename.endswith('.py') and filename != '__init__.py':
+                    extension_name = f'cogs.{filename[:-3]}'
+                    try:
+                        await self.load_extension(extension_name)
+                        logger.info(f'Loaded {extension_name}')
+                    except Exception as e:
+                        logger.error(f'Failed to load {extension_name}: {e}')
+        else:
+             logger.warning("No cogs directory found.")
 
         # Sync slash commands
         try:
