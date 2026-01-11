@@ -160,7 +160,7 @@ class ModMail(commands.Cog):
                 await self._send_dm_safe(message.author, embed=discord.Embed(
                     title="ModMail Started", 
                     description="A session has been started with the moderators. Messages you send here will be forwarded to them.",
-                    color=discord.Color.green()
+                    color=discord.Color.default()
                 ))
 
                 # Send initial message via webhook
@@ -249,8 +249,12 @@ class ModMail(commands.Cog):
 
         try:
              files = [await f.to_file() for f in message.attachments]
-             embed = discord.Embed(description=message.content, color=discord.Color.green())
-             embed.set_author(name=message.author.display_name, icon_url=message.author.display_avatar.url)
+             embed = discord.Embed(
+                 title="A moderator has replied",
+                 description=message.content, 
+                 color=discord.Color.from_str("#00ff00")
+             )
+             # embed.set_author(name=message.author.display_name, icon_url=message.author.display_avatar.url)
              await self._send_dm_safe(user, embed=embed, files=files)
              
              self.modmail_sessions[session_user_id]['last_activity'] = datetime.utcnow().isoformat()
@@ -285,13 +289,33 @@ class ModMail(commands.Cog):
                 await user.send(embed=discord.Embed(
                     title="Session Closed", 
                     description="This modmail session has been closed by a moderator.",
-                    color=discord.Color.red()
+                    color=discord.Color.default()
                 ))
             except:
                 pass
+
+        # Log closure to main channel
+        if self.modmail_channel_id:
+             main_channel = self.bot.get_channel(self.modmail_channel_id)
+             if main_channel and isinstance(main_channel, discord.TextChannel):
+                 try:
+                    log_embed = discord.Embed(
+                        title="📪 ModMail Closed",
+                        description=f"**User:** <@{session_user_id}> (`{session_user_id}`)\n**Thread:** {ctx.channel.mention}\n**Closed By:** {ctx.author.mention}",
+                        color=discord.Color.from_str("#ff0000"),
+                        timestamp=datetime.utcnow()
+                    )
+                    await main_channel.send(embed=log_embed)
+                 except Exception as e:
+                    logger.error(f"Failed to send modmail close log: {e}")
         
         await ctx.send("Session closed. Archiving thread...")
-        await ctx.channel.edit(archived=True, locked=True)
+        
+        new_name = f"🔒 {ctx.channel.name}"
+        if len(new_name) > 100:
+            new_name = new_name[:100]
+            
+        await ctx.channel.edit(name=new_name, archived=True, locked=True)
 
     @tasks.loop(minutes=1)
     async def cleanup_inactive_sessions(self):
@@ -332,7 +356,7 @@ class ModMail(commands.Cog):
                      await user.send(embed=discord.Embed(
                          title="Session Closed",
                          description="Modmail session timed out due to inactivity.",
-                         color=discord.Color.red()
+                         color=discord.Color.default()
                      ))
                  except:
                      pass
