@@ -143,6 +143,19 @@ class ModMail(commands.Cog):
                     # Fallback to public thread if private threads fail (e.g. no boost)
                     thread = await main_channel.create_thread(name=f"ModMail - {message.author.name}")
 
+                # Log to main channel
+                try:
+                    log_embed = discord.Embed(
+                        title="📨 New ModMail Created",
+                        description=f"**User:** {message.author.mention} (`{message.author.id}`)\n**Thread:** {thread.mention}",
+                        color=discord.Color.gold(),
+                        timestamp=datetime.utcnow()
+                    )
+                    log_embed.set_thumbnail(url=message.author.display_avatar.url)
+                    await main_channel.send(embed=log_embed)
+                except Exception as e:
+                    logger.error(f"Failed to send modmail log: {e}")
+
                 # Notify user
                 await self._send_dm_safe(message.author, embed=discord.Embed(
                     title="ModMail Started", 
