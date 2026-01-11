@@ -11,7 +11,7 @@ from pydantic_settings import BaseSettings
 class Config(BaseSettings):
     """Bot configuration settings."""
 
-    discord_token: str = Field(default='demo_token')
+    discord_token: str = Field(...)
     guild_id: Optional[int] = Field(default=None)
     database_url: str = Field(default='sqlite+aiosqlite:///fun2oosh.db')
     log_level: str = Field(default='INFO')

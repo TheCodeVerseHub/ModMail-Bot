@@ -6,6 +6,7 @@ from typing import Optional
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
+from pydantic import ValidationError
 from utils.config import Config
 
 # Load environment variables
@@ -39,6 +40,20 @@ class ModMailBot(commands.Bot):
         )
 
         self.config = config
+
+    async def on_command_error(self, ctx: commands.Context, error: commands.CommandError):
+        """Global error handler."""
+        if isinstance(error, commands.CommandNotFound):
+            return
+        elif isinstance(error, commands.MissingPermissions):
+            await ctx.send("You don't have permission to do that.", delete_after=5)
+        elif isinstance(error, commands.NotOwner):
+            await ctx.send("This command is restricted to the bot owner.", delete_after=5)
+        elif isinstance(error, commands.CommandOnCooldown):
+            await ctx.send(f"Command is on cooldown. Try again in {error.retry_after:.2f}s.", delete_after=5)
+        else:
+            logger.error(f"Unhandled error in command {ctx.command}: {error}", exc_info=error)
+            await ctx.send("An unexpected error occurred.")
 
     async def setup_hook(self) -> None:
         """Setup hook called before the bot starts."""
@@ -78,7 +93,11 @@ class ModMailBot(commands.Bot):
 
 async def main():
     """Main function to run the bot."""
-    config = Config()
+    try:
+        config = Config()
+    except ValidationError as e:
+        logger.error(f"Configuration Error: {e}")
+        return
 
     if not config.discord_token:
         logger.error("DISCORD_TOKEN not found in environment variables.")

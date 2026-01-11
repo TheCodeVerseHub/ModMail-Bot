@@ -8,6 +8,7 @@ from utils.config import Config
 from typing import Optional, Dict, Any, Union
 import asyncio
 import json
+import aiofiles
 from pathlib import Path
 from datetime import datetime, timedelta
 import logging
@@ -29,15 +30,21 @@ class ModMail(commands.Cog):
         self.config = config
         self.modmail_channel_id: Optional[int] = getattr(config, 'modmail_channel_id', None)
         self.RESET_DELAY_SECONDS: int = getattr(config, 'modmail_reset_seconds', 600)
-        self._dm_semaphore: asyncio.Semaphore = asyncio.Semaphore(2)
+        self._dm_semaphore: asyncio.Semaphore = asyncio.Semaphore(10) # Simultaneous DMs
         self._dm_channel_cache: Dict[int, discord.DMChannel] = {}
         self._webhook: Optional[discord.Webhook] = None
         
+        # Per-user lock to ensure logical consistency
+        self._user_locks: Dict[int, asyncio.Lock] = {}
+        
+        # Anti-Spam: 1 message every 2 seconds per user bucket
+        self.spam_control = commands.CooldownMapping.from_cooldown(1, 2.0, commands.BucketType.user)
+
+    async def cog_load(self):
         try:
-            self._load_sessions_from_file()
+            await self._load_sessions_from_file()
         except Exception:
             logger.exception("modmail: failed to load persisted sessions")
-        
         self.cleanup_inactive_sessions.start()
 
     def cog_unload(self):
@@ -82,12 +89,13 @@ class ModMail(commands.Cog):
         self._webhook = await channel.create_webhook(name="ModMail Relay")
         return self._webhook
 
-    def _load_sessions_from_file(self):
+    async def _load_sessions_from_file(self):
         if not self.SESSIONS_FILE.exists():
             return
         try:
-            with self.SESSIONS_FILE.open("r", encoding="utf-8") as fh:
-                data = json.load(fh)
+            async with aiofiles.open(self.SESSIONS_FILE, "r", encoding="utf-8") as fh:
+                content = await fh.read()
+                data = json.loads(content)
             for k, v in data.items():
                 try:
                     self.modmail_sessions[int(k)] = v
@@ -96,12 +104,12 @@ class ModMail(commands.Cog):
         except Exception:
             logger.exception("modmail: error reading sessions file")
 
-    def _persist_sessions_to_file(self):
+    async def _persist_sessions_to_file(self):
         try:
             self.SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
             dumpable = {str(k): v for k, v in self.modmail_sessions.items()}
-            with self.SESSIONS_FILE.open("w", encoding="utf-8") as fh:
-                json.dump(dumpable, fh)
+            async with aiofiles.open(self.SESSIONS_FILE, "w", encoding="utf-8") as fh:
+                await fh.write(json.dumps(dumpable))
         except Exception:
             logger.exception("modmail: failed to persist sessions to file")
 
@@ -120,100 +128,111 @@ class ModMail(commands.Cog):
             await self.handle_thread_reply(message)
 
     async def handle_dm_message(self, message: discord.Message):
+        # Spam Control
+        bucket = self.spam_control.get_bucket(message)
+        retry_after = bucket.update_rate_limit() if bucket else None
+
+        if retry_after:
+            # Optionally log or just return
+            return
+
         try:
             user_id = message.author.id
-            session = self.modmail_sessions.get(user_id)
-            
-            if not self.modmail_channel_id:
-                 await message.channel.send("ModMail system is currently disabled (Channel not set).")
-                 return
-                 
-            main_channel = self.bot.get_channel(self.modmail_channel_id)
-            if not main_channel or not isinstance(main_channel, discord.TextChannel):
-                 await message.channel.send("ModMail system is unavailable (Invalid channel configuration).")
-                 return
+            if user_id not in self._user_locks:
+                self._user_locks[user_id] = asyncio.Lock()
 
-            webhook = await self._get_or_create_webhook(main_channel)
-
-            if not session:
-                # Create new session
-                try:
-                    thread = await main_channel.create_thread(name=f"ModMail - {message.author.name}", type=discord.ChannelType.private_thread)
-                except discord.HTTPException:
-                    # Fallback to public thread if private threads fail (e.g. no boost)
-                    thread = await main_channel.create_thread(name=f"ModMail - {message.author.name}")
-
-                # Log to main channel
-                try:
-                    log_embed = discord.Embed(
-                        title="📨 New ModMail Created",
-                        description=f"**User:** {message.author.mention} (`{message.author.id}`)\n**Thread:** {thread.mention}",
-                        color=discord.Color.gold(),
-                        timestamp=datetime.utcnow()
-                    )
-                    log_embed.set_thumbnail(url=message.author.display_avatar.url)
-                    await main_channel.send(content="@here", embed=log_embed)
-                except Exception as e:
-                    logger.error(f"Failed to send modmail log: {e}")
-
-                # Notify user
-                await self._send_dm_safe(message.author, embed=discord.Embed(
-                    title="ModMail Started", 
-                    description="A session has been started with the moderators. Messages you send here will be forwarded to them.",
-                    color=discord.Color.default()
-                ))
-
-                # Send initial message via webhook
-                files = [await f.to_file() for f in message.attachments]
-                try:
-                    await webhook.send(
-                        content=message.content,
-                        username=message.author.name,
-                        avatar_url=message.author.display_avatar.url,
-                        thread=thread,
-                        files=files
-                    )
-                except Exception as e:
-                    await thread.send(f"Failed to relay message from user: {e}")
-                    raise e
+            async with self._user_locks[user_id]:
+                session = self.modmail_sessions.get(user_id)
                 
-                self.modmail_sessions[user_id] = {
-                    'thread_id': thread.id,
-                    'last_activity': datetime.utcnow().isoformat()
-                }
-            else:
-                # Continue session
-                thread_id = session.get('thread_id')
-                thread = None
-                if thread_id:
-                    thread = main_channel.get_thread(int(thread_id))
+                if not self.modmail_channel_id:
+                     await message.channel.send("ModMail system is currently disabled (Channel not set).")
+                     return
+                     
+                main_channel = self.bot.get_channel(self.modmail_channel_id)
+                if not main_channel or not isinstance(main_channel, discord.TextChannel):
+                     await message.channel.send("ModMail system is unavailable (Invalid channel configuration).")
+                     return
 
-                if not thread:
-                     # Thread deleted manually? Re-create
-                     try:
-                        thread = await main_channel.create_thread(name=f"ModMail - {message.author.name}", type=discord.ChannelType.private_thread)
-                     except discord.HTTPException:
-                        thread = await main_channel.create_thread(name=f"ModMail - {message.author.name}")
+                webhook = await self._get_or_create_webhook(main_channel)
 
-                     session['thread_id'] = thread.id
-                     # Optionally notify mods that user is back but thread was lost
-                     await thread.send(f"Wait, previous thread was lost. Resuming session for {message.author.mention}.")
+                if not session:
+                    # Create new session
+                    try:
+                        thread = await main_channel.create_thread(name=f"ModMail - {message.author.name} ({user_id})", type=discord.ChannelType.private_thread)
+                    except discord.HTTPException:
+                        # Fallback to public thread if private threads fail
+                        thread = await main_channel.create_thread(name=f"ModMail - {message.author.name} ({user_id})")
 
-                files = [await f.to_file() for f in message.attachments]
-                try:
-                    await webhook.send(
-                        content=message.content,
-                        username=message.author.name,
-                        avatar_url=message.author.display_avatar.url,
-                        thread=thread,
-                        files=files
-                    )
-                except Exception as e:
-                     await thread.send(f"Failed to relay message from user: {e}")
-                     raise e
-                session['last_activity'] = datetime.utcnow().isoformat()
+                    # Log to main channel
+                    try:
+                        log_embed = discord.Embed(
+                            title="📨 New ModMail Created",
+                            description=f"**User:** {message.author.mention} (`{message.author.id}`)\n**Thread:** {thread.mention}",
+                            color=discord.Color.gold(),
+                            timestamp=datetime.utcnow()
+                        )
+                        log_embed.set_thumbnail(url=message.author.display_avatar.url)
+                        await main_channel.send(content="@here", embed=log_embed)
+                    except Exception as e:
+                        logger.error(f"Failed to send modmail log: {e}")
 
-            self._persist_sessions_to_file()
+                    # Notify user
+                    await self._send_dm_safe(message.author, embed=discord.Embed(
+                        title="ModMail Started", 
+                        description="A session has been started with the moderators. Messages you send here will be forwarded to them.",
+                        color=discord.Color.default()
+                    ))
+
+                    # Send initial message via webhook
+                    files = [await f.to_file() for f in message.attachments]
+                    try:
+                        await webhook.send(
+                            content=message.content,
+                            username=message.author.name,
+                            avatar_url=message.author.display_avatar.url,
+                            thread=thread,
+                            files=files
+                        )
+                    except Exception as e:
+                        await thread.send(f"Failed to relay message from user: {e}")
+                        raise e
+                    
+                    self.modmail_sessions[user_id] = {
+                        'thread_id': thread.id,
+                        'last_activity': datetime.utcnow().isoformat()
+                    }
+                else:
+                    # Continue session
+                    thread_id = session.get('thread_id')
+                    thread = None
+                    if thread_id:
+                        thread = main_channel.get_thread(int(thread_id))
+
+                    if not thread:
+                         # Thread deleted manually? Re-create
+                         try:
+                            thread = await main_channel.create_thread(name=f"ModMail - {message.author.name} ({user_id})", type=discord.ChannelType.private_thread)
+                         except discord.HTTPException:
+                            thread = await main_channel.create_thread(name=f"ModMail - {message.author.name} ({user_id})")
+
+                         session['thread_id'] = thread.id
+                         await thread.send(f"Wait, previous thread was lost. Resuming session for {message.author.mention}.")
+
+                    files = [await f.to_file() for f in message.attachments]
+                    try:
+                        await webhook.send(
+                            content=message.content,
+                            username=message.author.name,
+                            avatar_url=message.author.display_avatar.url,
+                            thread=thread,
+                            files=files
+                        )
+                    except Exception as e:
+                         await thread.send(f"Failed to relay message from user: {e}")
+                         raise e
+                    session['last_activity'] = datetime.utcnow().isoformat()
+
+                await self._persist_sessions_to_file()
         except Exception as e:
             logger.exception(f"Error handling DM message from {message.author.id}")
             try:
@@ -258,7 +277,7 @@ class ModMail(commands.Cog):
              await self._send_dm_safe(user, embed=embed, files=files)
              
              self.modmail_sessions[session_user_id]['last_activity'] = datetime.utcnow().isoformat()
-             self._persist_sessions_to_file()
+             await self._persist_sessions_to_file()
              # Optional: React to confirm sent
              await message.add_reaction("✅")
         except Exception as e:
@@ -281,7 +300,7 @@ class ModMail(commands.Cog):
 
         # Close session
         del self.modmail_sessions[session_user_id]
-        self._persist_sessions_to_file()
+        await self._persist_sessions_to_file()
         
         user = self.bot.get_user(session_user_id)
         if user:
@@ -362,7 +381,7 @@ class ModMail(commands.Cog):
                      pass
         
         if to_remove:
-            self._persist_sessions_to_file()
+            await self._persist_sessions_to_file()
 
     @commands.command(name="set_modmail_channel")
     @commands.has_permissions(administrator=True)
