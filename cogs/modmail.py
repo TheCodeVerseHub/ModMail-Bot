@@ -152,7 +152,7 @@ class ModMail(commands.Cog):
                         timestamp=datetime.utcnow()
                     )
                     log_embed.set_thumbnail(url=message.author.display_avatar.url)
-                    await main_channel.send(embed=log_embed)
+                    await main_channel.send(content="@here", embed=log_embed)
                 except Exception as e:
                     logger.error(f"Failed to send modmail log: {e}")
 
@@ -239,7 +239,7 @@ class ModMail(commands.Cog):
             
         if message.content.startswith(tuple([p + "close" for p in prefixes])):
              return
-        if message.content.startswith("m!close"):
+        if message.content.startswith("!!close"):
              return
 
         user = self.bot.get_user(session_user_id)
@@ -250,8 +250,8 @@ class ModMail(commands.Cog):
         try:
              files = [await f.to_file() for f in message.attachments]
              embed = discord.Embed(
-                 title="A moderator has replied",
-                 description=message.content, 
+                 title="A Moderator has Replied",
+                 description="> "+message.content, 
                  color=discord.Color.from_str("#00ff00")
              )
              # embed.set_author(name=message.author.display_name, icon_url=message.author.display_avatar.url)

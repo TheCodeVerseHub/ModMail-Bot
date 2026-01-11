@@ -32,7 +32,7 @@ class ModMailBot(commands.Bot):
         intents.presences = True
 
         super().__init__(
-            command_prefix='m!',
+            command_prefix='!!',
             intents=intents,
             help_command=None,
             owner_id=config.owner_id
