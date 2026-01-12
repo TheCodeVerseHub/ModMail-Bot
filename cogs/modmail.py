@@ -2,7 +2,7 @@
 Modmail cog: Users DM the bot, messages are forwarded to a modmail channel. Mods can reply from the channel.
 """
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 from discord import app_commands
 from utils.config import Config
 from typing import Optional, Dict, Any, Union
@@ -29,7 +29,6 @@ class ModMail(commands.Cog):
         self.bot = bot
         self.config = config
         self.modmail_channel_id: Optional[int] = getattr(config, 'modmail_channel_id', None)
-        self.RESET_DELAY_SECONDS: int = getattr(config, 'modmail_reset_seconds', 600)
         self._dm_semaphore: asyncio.Semaphore = asyncio.Semaphore(10) # Simultaneous DMs
         self._dm_channel_cache: Dict[int, discord.DMChannel] = {}
         self._webhook: Optional[discord.Webhook] = None
@@ -45,10 +44,9 @@ class ModMail(commands.Cog):
             await self._load_sessions_from_file()
         except Exception:
             logger.exception("modmail: failed to load persisted sessions")
-        self.cleanup_inactive_sessions.start()
 
     def cog_unload(self):
-        self.cleanup_inactive_sessions.cancel()
+        pass
 
     async def _send_with_retry(self, send_func, *args, max_retries=3, **kwargs):
         for attempt in range(max_retries):
@@ -335,53 +333,6 @@ class ModMail(commands.Cog):
             new_name = new_name[:100]
             
         await ctx.channel.edit(name=new_name, archived=True, locked=True)
-
-    @tasks.loop(minutes=1)
-    async def cleanup_inactive_sessions(self):
-        now = datetime.utcnow()
-        to_remove = []
-        
-        for user_id, session in self.modmail_sessions.items():
-            last_activity_str = session.get('last_activity')
-            if not last_activity_str:
-                continue
-                
-            last_activity = datetime.fromisoformat(last_activity_str)
-            if (now - last_activity).total_seconds() > self.RESET_DELAY_SECONDS:
-                to_remove.append(user_id)
-
-        for user_id in to_remove:
-            session = self.modmail_sessions.pop(user_id)
-            thread_id = session.get('thread_id')
-            
-            # Close thread
-            if self.modmail_channel_id:
-                channel = self.bot.get_channel(self.modmail_channel_id)
-                if channel and isinstance(channel, discord.TextChannel):
-                    thread = None
-                    if thread_id:
-                        thread = channel.get_thread(int(thread_id))
-                    if thread:
-                         try:
-                             await thread.send("Session timed out due to inactivity.")
-                             await thread.edit(archived=True, locked=True)
-                         except:
-                             pass
-            
-            # Notify User
-            user = self.bot.get_user(user_id)
-            if user:
-                 try:
-                     await user.send(embed=discord.Embed(
-                         title="Session Closed",
-                         description="Modmail session timed out due to inactivity.",
-                         color=discord.Color.default()
-                     ))
-                 except:
-                     pass
-        
-        if to_remove:
-            await self._persist_sessions_to_file()
 
     @commands.command(name="set_modmail_channel")
     @commands.has_permissions(administrator=True)
