@@ -156,23 +156,22 @@ class ModMail(commands.Cog):
                 if not session:
                     # Create new session
                     try:
-                        thread = await main_channel.create_thread(name=f"ModMail - {message.author.name} ({user_id})", type=discord.ChannelType.private_thread)
-                    except discord.HTTPException:
-                        # Fallback to public thread if private threads fail
-                        thread = await main_channel.create_thread(name=f"ModMail - {message.author.name} ({user_id})")
-
-                    # Log to main channel
-                    try:
+                        # Log to main channel first
                         log_embed = discord.Embed(
                             title="📨 New ModMail Created",
-                            description=f"**User:** {message.author.mention} (`{message.author.id}`)\n**Thread:** {thread.mention}",
+                            description=f"**User:** {message.author.mention} (`{message.author.id}`)",
                             color=discord.Color.gold(),
                             timestamp=datetime.utcnow()
                         )
                         log_embed.set_thumbnail(url=message.author.display_avatar.url)
-                        await main_channel.send(content="@here", embed=log_embed)
+                        starter_msg = await main_channel.send(content="@here", embed=log_embed)
+
+                        # Create public thread from the log message
+                        thread = await starter_msg.create_thread(name=f"ModMail - {message.author.name} ({user_id})")
                     except Exception as e:
-                        logger.error(f"Failed to send modmail log: {e}")
+                        logger.error(f"Failed to create modmail session: {e}")
+                        await message.channel.send("An error occurred while starting the modmail session.")
+                        return
 
                     # Notify user
                     await self._send_dm_safe(message.author, embed=discord.Embed(
