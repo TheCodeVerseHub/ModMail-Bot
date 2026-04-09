@@ -10,7 +10,7 @@ env/
 
 # Environment Variables
 .env
-
+.vscode
 # Logs
 *.log
 
