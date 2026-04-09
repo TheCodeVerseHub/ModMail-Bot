@@ -13,7 +13,7 @@ env/
 .vscode
 # Logs
 *.log
-
+.local
 # Database
 *.db
 *.sqlite3
