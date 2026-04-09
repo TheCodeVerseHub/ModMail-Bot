@@ -19,8 +19,8 @@ logger = logging.getLogger(__name__)
 
 
 class ModMail(commands.Cog):
-    # Session format per user_id:
-    # { 'thread_id': int, 'last_activity': ISO8601 timestamp }
+    # Session format per user_id (best-effort; older persisted schemas may exist):
+    # { 'thread_id': int, 'last_activity': ISO8601 timestamp, 'state': 'open'|'closed'|'resolved' }
     modmail_sessions: Dict[int, Dict[str, Any]] = {}
     _session_locks: Dict[int, asyncio.Lock] = {}
     SESSIONS_FILE = Path("data/modmail_sessions.json")
@@ -111,6 +111,44 @@ class ModMail(commands.Cog):
         except Exception:
             logger.exception("modmail: failed to persist sessions to file")
 
+    def _is_session_expired(self, session: Dict[str, Any]) -> bool:
+        reset_seconds = int(getattr(self.config, 'modmail_reset_seconds', 0) or 0)
+        if reset_seconds <= 0:
+            return False
+
+        last_activity = session.get('last_activity')
+        if not last_activity:
+            return False
+
+        try:
+            last_dt = datetime.fromisoformat(str(last_activity))
+        except Exception:
+            return False
+
+        return (datetime.utcnow() - last_dt) > timedelta(seconds=reset_seconds)
+
+    def _is_session_closed(self, session: Dict[str, Any]) -> bool:
+        state = str(session.get('state') or '').lower()
+        return state in {'closed', 'resolved'}
+
+    def _get_thread_from_session(
+        self,
+        session: Dict[str, Any],
+        main_channel: discord.TextChannel,
+    ) -> Optional[discord.Thread]:
+        thread_id = session.get('thread_id')
+        if not thread_id:
+            return None
+        try:
+            thread = main_channel.get_thread(int(thread_id))
+        except Exception:
+            return None
+        if not thread:
+            return None
+        if getattr(thread, 'archived', False) or getattr(thread, 'locked', False):
+            return None
+        return thread
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author.bot:
@@ -153,8 +191,15 @@ class ModMail(commands.Cog):
 
                 webhook = await self._get_or_create_webhook(main_channel)
 
-                if not session:
-                    # Create new session
+                thread: Optional[discord.Thread] = None
+                session_active = False
+                if session and isinstance(session, dict):
+                    if not self._is_session_closed(session) and not self._is_session_expired(session):
+                        thread = self._get_thread_from_session(session, main_channel)
+                        session_active = thread is not None
+
+                if not session_active:
+                    # Create new session (first-time or after closure/expiry)
                     try:
                         # Log to main channel first
                         log_embed = discord.Embed(
@@ -173,12 +218,20 @@ class ModMail(commands.Cog):
                         await message.channel.send("An error occurred while starting the modmail session.")
                         return
 
+                    assert thread is not None
+
                     # Notify user
-                    await self._send_dm_safe(message.author, embed=discord.Embed(
-                        title="ModMail Started", 
-                        description="A session has been started with the moderators. Messages you send here will be forwarded to them.",
-                        color=discord.Color.default()
-                    ))
+                    await self._send_dm_safe(
+                        message.author,
+                        embed=discord.Embed(
+                            title="ModMail Started",
+                            description=(
+                                "✅ Your message has been received and a new modmail session has been opened.\n"
+                                "Messages you send here will be forwarded to the moderators."
+                            ),
+                            color=discord.Color.default(),
+                        ),
+                    )
 
                     # Send initial message via webhook
                     files = [await f.to_file() for f in message.attachments]
@@ -191,29 +244,20 @@ class ModMail(commands.Cog):
                             files=files
                         )
                     except Exception as e:
-                        await thread.send(f"Failed to relay message from user: {e}")
+                        if thread is not None:
+                            await thread.send(f"Failed to relay message from user: {e}")
                         raise e
                     
                     self.modmail_sessions[user_id] = {
                         'thread_id': thread.id,
-                        'last_activity': datetime.utcnow().isoformat()
+                        'last_activity': datetime.utcnow().isoformat(),
+                        'state': 'open'
                     }
                 else:
                     # Continue session
-                    thread_id = session.get('thread_id')
-                    thread = None
-                    if thread_id:
-                        thread = main_channel.get_thread(int(thread_id))
-
-                    if not thread:
-                         # Thread deleted manually? Re-create
-                         try:
-                            thread = await main_channel.create_thread(name=f"ModMail - {message.author.name} ({user_id})", type=discord.ChannelType.private_thread)
-                         except discord.HTTPException:
-                            thread = await main_channel.create_thread(name=f"ModMail - {message.author.name} ({user_id})")
-
-                         session['thread_id'] = thread.id
-                         await thread.send(f"Wait, previous thread was lost. Resuming session for {message.author.mention}.")
+                    # `thread` is guaranteed by session_active
+                    assert thread is not None
+                    assert isinstance(session, dict)
 
                     files = [await f.to_file() for f in message.attachments]
                     try:
@@ -225,9 +269,11 @@ class ModMail(commands.Cog):
                             files=files
                         )
                     except Exception as e:
-                         await thread.send(f"Failed to relay message from user: {e}")
+                         if thread is not None:
+                             await thread.send(f"Failed to relay message from user: {e}")
                          raise e
                     session['last_activity'] = datetime.utcnow().isoformat()
+                    session.setdefault('state', 'open')
 
                 await self._persist_sessions_to_file()
         except Exception as e:
@@ -359,6 +405,7 @@ class ModMail(commands.Cog):
             else:
                 await interaction.response.send_message("Please specify a text channel or use this in a text channel.", ephemeral=True)
                 return
+        assert channel is not None
         self.modmail_channel_id = channel.id
         await interaction.response.send_message(f"Modmail channel set to {channel.mention}.", ephemeral=True)
 
