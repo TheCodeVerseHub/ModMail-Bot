@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 from typing import Optional
 
@@ -13,14 +14,31 @@ from utils.config import Config
 load_dotenv()
 
 # Configure logging
+handlers: list[logging.Handler] = [logging.StreamHandler()]
+
+# File logging is best-effort: some hosts have very limited disk.
+try:
+    handlers.append(
+        RotatingFileHandler(
+            'modmail_bot.log',
+            maxBytes=1_000_000,
+            backupCount=2,
+            encoding='utf-8',
+            delay=True,
+        )
+    )
+except OSError:
+    # Disk full / read-only FS / permission issue — continue with console logging.
+    pass
+
 logging.basicConfig(
     level=getattr(logging, os.getenv('LOG_LEVEL', 'INFO')),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('modmail_bot.log'),
-        logging.StreamHandler()
-    ]
+    handlers=handlers,
 )
+
+# Prevent noisy "--- Logging error ---" tracebacks in production.
+logging.raiseExceptions = False
 logger = logging.getLogger(__name__)
 
 class ModMailBot(commands.Bot):

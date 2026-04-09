@@ -93,7 +93,13 @@ class ModMail(commands.Cog):
         try:
             async with aiofiles.open(self.SESSIONS_FILE, "r", encoding="utf-8") as fh:
                 content = await fh.read()
-                data = json.loads(content)
+                if not content.strip():
+                    return
+                try:
+                    data = json.loads(content)
+                except json.JSONDecodeError:
+                    logger.warning("modmail: sessions file is not valid JSON; ignoring")
+                    return
             for k, v in data.items():
                 try:
                     self.modmail_sessions[int(k)] = v
@@ -106,8 +112,10 @@ class ModMail(commands.Cog):
         try:
             self.SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
             dumpable = {str(k): v for k, v in self.modmail_sessions.items()}
-            async with aiofiles.open(self.SESSIONS_FILE, "w", encoding="utf-8") as fh:
+            tmp_path = self.SESSIONS_FILE.with_suffix(self.SESSIONS_FILE.suffix + ".tmp")
+            async with aiofiles.open(tmp_path, "w", encoding="utf-8") as fh:
                 await fh.write(json.dumps(dumpable))
+            tmp_path.replace(self.SESSIONS_FILE)
         except Exception:
             logger.exception("modmail: failed to persist sessions to file")
 
