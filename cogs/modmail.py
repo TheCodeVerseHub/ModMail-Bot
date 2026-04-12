@@ -231,7 +231,7 @@ class ModMail(commands.Cog):
                 await self._cancel_pending_confirmation(user)
                 return
 
-            # ✅: start session and flush queued messages
+            # : start session and flush queued messages
             if not self.modmail_channel_id:
                 self._pending_confirmations.pop(user_id, None)
                 return
@@ -282,9 +282,9 @@ class ModMail(commands.Cog):
             embed=discord.Embed(
                 title="ModMail Started",
                 description=(
-                    "✅ A modmail session is now open. Messages you send here will be forwarded to the moderators."
+                    "A modmail session is now open. Messages you send here will be forwarded to the moderators."
                 ),
-                color=discord.Color.default(),
+                color=discord.Color.from_str("#00ff00"),
             ),
         )
 
@@ -325,7 +325,7 @@ class ModMail(commands.Cog):
                 await self._send_dm_safe(
                     user,
                     content=(
-                        "⚠️ Some attachments were too large to hold while waiting for confirmation. "
+                        "Some attachments were too large to hold while waiting for confirmation. "
                         "If needed, please resend them now that the session is open."
                     ),
                 )
@@ -572,7 +572,7 @@ class ModMail(commands.Cog):
         except Exception as e:
             logger.exception(f"Error handling DM message from {message.author.id}")
             try:
-                await message.channel.send(f"❌ An internal error occurred: {str(e)}")
+                await message.channel.send(f"An internal error occurred: {str(e)}")
             except:
                 pass
 
@@ -599,7 +599,7 @@ class ModMail(commands.Cog):
 
         user = self.bot.get_user(session_user_id)
         if not user:
-            await message.channel.send("⚠️ User cannot be found (might have left shared servers).")
+            await message.channel.send("User cannot be found (might have left shared servers).")
             return
 
         try:
@@ -607,7 +607,7 @@ class ModMail(commands.Cog):
              embed = discord.Embed(
                  title="A Moderator has Replied",
                  description="> "+message.content, 
-                 color=discord.Color.from_str("#00ff00")
+                 color=discord.Color.purple()
              )
              # embed.set_author(name=message.author.display_name, icon_url=message.author.display_avatar.url)
              await self._send_dm_safe(user, embed=embed, files=files)
@@ -617,7 +617,7 @@ class ModMail(commands.Cog):
              # Optional: React to confirm sent
              await message.add_reaction("✅")
         except Exception as e:
-            await message.channel.send(f"❌ Failed to send to user: {e}")
+            await message.channel.send(f"Failed to send to user: {e}")
 
     @commands.command(name="close", aliases=["mclose"])
     async def close_session(self, ctx):
@@ -644,7 +644,7 @@ class ModMail(commands.Cog):
                 await user.send(embed=discord.Embed(
                     title="Session Closed", 
                     description="This modmail session has been closed by a moderator.",
-                    color=discord.Color.default()
+                    color=discord.Color.from_str("#ff0000")
                 ))
             except:
                 pass
