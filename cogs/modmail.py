@@ -606,7 +606,7 @@ class ModMail(commands.Cog):
              files = [await f.to_file() for f in message.attachments]
              embed = discord.Embed(
                  title="A Moderator has Replied",
-                 description="> "+message.content, 
+                 description=message.content, 
                  color=discord.Color.purple()
              )
              # embed.set_author(name=message.author.display_name, icon_url=message.author.display_avatar.url)
