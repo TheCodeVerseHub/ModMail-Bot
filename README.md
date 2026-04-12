@@ -40,6 +40,7 @@ A simple and efficient ModMail bot for Discord, built with `discord.py`. This bo
     MODMAIL_CHANNEL_ID=your_modmail_channel_id
     LOG_LEVEL=INFO
     MODMAIL_RESET_SECONDS=600
+    MODMAIL_CONFIRM_TIMEOUT_SECONDS=300
     ```
 
 5.  **Run the bot:**
@@ -49,7 +50,7 @@ A simple and efficient ModMail bot for Discord, built with `discord.py`. This bo
 
 ## Usage
 
-- **Users**: DM the bot to start a conversation with moderators.
+- **Users**: DM the bot — it will ask you to confirm before opening a ModMail thread. Reply **yes** to start or **no** to cancel.
 - **Moderators**:
     - Use `!reply_modmail <user_id> <message>` (prefix command) or `/reply_modmail` (slash command) to reply to a user.
     - Use `!set_modmail_channel` or `/set_modmail_channel` to change the log channel.

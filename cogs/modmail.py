@@ -13,6 +13,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import logging
 import random
+import io
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,207 @@ class ModMail(commands.Cog):
         
         # Anti-Spam: 1 message every 2 seconds per user bucket
         self.spam_control = commands.CooldownMapping.from_cooldown(1, 2.0, commands.BucketType.user)
+
+        # DM confirmation state:
+        # When a user DMs without an active session, we ask them to confirm
+        # before creating a new modmail thread.
+        # { user_id: { 'created_at': iso, 'messages': [ {content, attachments, created_at} ] } }
+        self._pending_confirmations: Dict[int, Dict[str, Any]] = {}
+
+        # Limits for queued messages while awaiting confirmation.
+        self._max_pending_messages: int = 5
+        # Store up to 8 MiB of attachment bytes per user while pending.
+        self._max_pending_attachment_bytes: int = 8 * 1024 * 1024
+
+    def _confirm_timeout_seconds(self) -> int:
+        try:
+            value = int(getattr(self.config, 'modmail_confirm_timeout_seconds', 300) or 300)
+        except Exception:
+            value = 300
+        return max(30, value)
+
+    def _parse_confirmation(self, content: str) -> Optional[bool]:
+        text = (content or '').strip().lower()
+        if not text:
+            return None
+        first = text.split()[0]
+        if first in {"yes", "y", "yeah", "yep", "sure", "ok", "okay", "confirm"}:
+            return True
+        if first in {"no", "n", "nope", "nah", "cancel", "stop"}:
+            return False
+        return None
+
+    def _pending_is_expired(self, pending: Dict[str, Any]) -> bool:
+        created_at = pending.get('created_at')
+        if not created_at:
+            return True
+        try:
+            created_dt = datetime.fromisoformat(str(created_at))
+        except Exception:
+            return True
+        return (datetime.utcnow() - created_dt) > timedelta(seconds=self._confirm_timeout_seconds())
+
+    async def _queue_pending_message(self, user_id: int, message: discord.Message):
+        pending = self._pending_confirmations.setdefault(
+            user_id,
+            {'created_at': datetime.utcnow().isoformat(), 'messages': []},
+        )
+
+        messages = pending.setdefault('messages', [])
+        if not isinstance(messages, list):
+            messages = []
+            pending['messages'] = messages
+
+        # Enforce max queued messages by dropping oldest.
+        while len(messages) >= self._max_pending_messages:
+            messages.pop(0)
+
+        attachment_payloads = []
+        # Only read attachments if the total size stays within budget.
+        existing_bytes = 0
+        for queued in messages:
+            for a in (queued.get('attachments') or []):
+                existing_bytes += int(a.get('size', 0) or 0)
+
+        to_read = []
+        total_new_bytes = 0
+        for att in message.attachments:
+            size = int(getattr(att, 'size', 0) or 0)
+            if size <= 0:
+                continue
+            total_new_bytes += size
+            to_read.append(att)
+
+        if (existing_bytes + total_new_bytes) <= self._max_pending_attachment_bytes:
+            for att in to_read:
+                try:
+                    data = await att.read()
+                    attachment_payloads.append({
+                        'filename': att.filename,
+                        'data': data,
+                        'size': len(data),
+                    })
+                except Exception:
+                    logger.exception("modmail: failed to read attachment while pending confirmation")
+        else:
+            # Skip storing large attachments; user can resend after confirming.
+            if to_read:
+                attachment_payloads.append({
+                    'filename': None,
+                    'data': None,
+                    'size': 0,
+                    'skipped': True,
+                })
+
+        messages.append({
+            'content': message.content or '',
+            'attachments': attachment_payloads,
+            'created_at': datetime.utcnow().isoformat(),
+        })
+
+    def _pending_to_discord_files(self, queued_attachments: list[dict]) -> tuple[list[discord.File], bool]:
+        files: list[discord.File] = []
+        had_skipped = False
+        for payload in queued_attachments or []:
+            if payload.get('skipped'):
+                had_skipped = True
+                continue
+            data = payload.get('data')
+            filename = payload.get('filename')
+            if not data or not filename:
+                continue
+            bio = io.BytesIO(data)
+            files.append(discord.File(bio, filename=filename))
+        return files, had_skipped
+
+    async def _send_modmail_confirmation_prompt(self, user: Union[discord.User, discord.Member]):
+        await self._send_dm_safe(
+            user,
+            embed=discord.Embed(
+                title="Start ModMail?",
+                description=(
+                    "I can open a ModMail thread so moderators can see your messages.\n\n"
+                    "Reply with **yes** to start, or **no** to cancel."
+                ),
+                color=discord.Color.blurple(),
+            ),
+        )
+
+    async def _start_new_session_and_flush_pending(
+        self,
+        user: Union[discord.User, discord.Member],
+        main_channel: discord.TextChannel,
+        webhook: discord.Webhook,
+        pending: Dict[str, Any],
+    ):
+        user_id = user.id
+        # Log to main channel first
+        log_embed = discord.Embed(
+            title="📨 New ModMail Created",
+            description=f"**User:** {user.mention} (`{user_id}`)",
+            color=discord.Color.gold(),
+            timestamp=datetime.utcnow(),
+        )
+        log_embed.set_thumbnail(url=user.display_avatar.url)
+        starter_msg = await main_channel.send(content="@here", embed=log_embed)
+        thread = await starter_msg.create_thread(name=f"ModMail - {user.name} ({user_id})")
+
+        await self._send_dm_safe(
+            user,
+            embed=discord.Embed(
+                title="ModMail Started",
+                description=(
+                    "✅ A modmail session is now open. Messages you send here will be forwarded to the moderators."
+                ),
+                color=discord.Color.default(),
+            ),
+        )
+
+        had_skipped_any = False
+        queued_messages = pending.get('messages') or []
+        if not isinstance(queued_messages, list):
+            queued_messages = []
+
+        for qm in queued_messages:
+            content = qm.get('content') or ''
+            files, had_skipped = self._pending_to_discord_files(qm.get('attachments') or [])
+            had_skipped_any = had_skipped_any or had_skipped
+            try:
+                if not content and not files:
+                    continue
+                send_kwargs: Dict[str, Any] = {
+                    'username': user.name,
+                    'avatar_url': user.display_avatar.url,
+                    'thread': thread,
+                }
+                if content:
+                    send_kwargs['content'] = content
+                if files:
+                    send_kwargs['files'] = files
+                await webhook.send(**send_kwargs)
+            except Exception as e:
+                await thread.send(f"Failed to relay queued message from user: {e}")
+                raise
+
+        if had_skipped_any:
+            try:
+                await self._send_dm_safe(
+                    user,
+                    content=(
+                        "⚠️ Some attachments were too large to hold while waiting for confirmation. "
+                        "If needed, please resend them now that the session is open."
+                    ),
+                )
+            except Exception:
+                pass
+
+        self.modmail_sessions[user_id] = {
+            'thread_id': thread.id,
+            'last_activity': datetime.utcnow().isoformat(),
+            'state': 'open',
+        }
+        await self._persist_sessions_to_file()
+
 
     async def cog_load(self):
         try:
@@ -207,60 +409,49 @@ class ModMail(commands.Cog):
                         session_active = thread is not None
 
                 if not session_active:
-                    # Create new session (first-time or after closure/expiry)
-                    try:
-                        # Log to main channel first
-                        log_embed = discord.Embed(
-                            title="📨 New ModMail Created",
-                            description=f"**User:** {message.author.mention} (`{message.author.id}`)",
-                            color=discord.Color.gold(),
-                            timestamp=datetime.utcnow()
-                        )
-                        log_embed.set_thumbnail(url=message.author.display_avatar.url)
-                        starter_msg = await main_channel.send(content="@here", embed=log_embed)
+                    # Ask for confirmation before creating a new session.
+                    pending = self._pending_confirmations.get(user_id)
+                    if pending and self._pending_is_expired(pending):
+                        self._pending_confirmations.pop(user_id, None)
+                        pending = None
 
-                        # Create public thread from the log message
-                        thread = await starter_msg.create_thread(name=f"ModMail - {message.author.name} ({user_id})")
-                    except Exception as e:
-                        logger.error(f"Failed to create modmail session: {e}")
-                        await message.channel.send("An error occurred while starting the modmail session.")
+                    decision = self._parse_confirmation(message.content)
+
+                    if pending is None:
+                        # First DM (or after close/expiry): queue this message and ask.
+                        await self._queue_pending_message(user_id, message)
+                        await self._send_modmail_confirmation_prompt(message.author)
                         return
 
-                    assert thread is not None
-
-                    # Notify user
-                    await self._send_dm_safe(
-                        message.author,
-                        embed=discord.Embed(
-                            title="ModMail Started",
-                            description=(
-                                "✅ Your message has been received and a new modmail session has been opened.\n"
-                                "Messages you send here will be forwarded to the moderators."
-                            ),
-                            color=discord.Color.default(),
-                        ),
-                    )
-
-                    # Send initial message via webhook
-                    files = [await f.to_file() for f in message.attachments]
-                    try:
-                        await webhook.send(
-                            content=message.content,
-                            username=message.author.name,
-                            avatar_url=message.author.display_avatar.url,
-                            thread=thread,
-                            files=files
+                    # We have a pending confirmation; handle yes/no or keep queuing.
+                    if decision is True:
+                        try:
+                            await self._start_new_session_and_flush_pending(
+                                user=message.author,
+                                main_channel=main_channel,
+                                webhook=webhook,
+                                pending=pending,
+                            )
+                        except Exception as e:
+                            logger.error(f"Failed to create modmail session: {e}")
+                            await message.channel.send("An error occurred while starting the modmail session.")
+                            return
+                        self._pending_confirmations.pop(user_id, None)
+                        return
+                    elif decision is False:
+                        self._pending_confirmations.pop(user_id, None)
+                        await self._send_dm_safe(
+                            message.author,
+                            content="Okay — I won’t start a modmail thread. If you change your mind, DM me again.",
                         )
-                    except Exception as e:
-                        if thread is not None:
-                            await thread.send(f"Failed to relay message from user: {e}")
-                        raise e
-                    
-                    self.modmail_sessions[user_id] = {
-                        'thread_id': thread.id,
-                        'last_activity': datetime.utcnow().isoformat(),
-                        'state': 'open'
-                    }
+                        return
+                    else:
+                        await self._queue_pending_message(user_id, message)
+                        await self._send_dm_safe(
+                            message.author,
+                            content="Please reply with **yes** to start ModMail or **no** to cancel.",
+                        )
+                        return
                 else:
                     # Continue session
                     # `thread` is guaranteed by session_active

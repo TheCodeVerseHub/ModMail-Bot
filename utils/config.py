@@ -23,6 +23,7 @@ class Config(BaseSettings):
     # Modmail settings
     modmail_channel_id: Optional[int] = Field(default=None)
     modmail_reset_seconds: int = Field(default=600)
+    modmail_confirm_timeout_seconds: int = Field(default=300)
 
     # CodeBuddy settings
     question_channel_id: Optional[int] = Field(default=None)
