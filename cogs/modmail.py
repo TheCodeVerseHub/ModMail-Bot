@@ -605,11 +605,10 @@ class ModMail(commands.Cog):
         try:
              files = [await f.to_file() for f in message.attachments]
              embed = discord.Embed(
-                 title="A Moderator has Replied",
-                 description="> "+message.content, 
+                 description=message.content,
                  color=discord.Color.purple()
              )
-             # embed.set_author(name=message.author.display_name, icon_url=message.author.display_avatar.url)
+             embed.set_author(name="Moderator")
              await self._send_dm_safe(user, embed=embed, files=files)
              
              self.modmail_sessions[session_user_id]['last_activity'] = datetime.utcnow().isoformat()
