@@ -50,7 +50,7 @@ A simple and efficient ModMail bot for Discord, built with `discord.py`. This bo
 
 ## Usage
 
-- **Users**: DM the bot — it will ask you to confirm before opening a ModMail thread. Reply **yes** to start or **no** to cancel.
+- **Users**: DM the bot — it will ask you to confirm before opening a ModMail thread. React with ✅ to start or ❌ to cancel.
 - **Moderators**:
     - Use `!reply_modmail <user_id> <message>` (prefix command) or `/reply_modmail` (slash command) to reply to a user.
     - Use `!set_modmail_channel` or `/set_modmail_channel` to change the log channel.

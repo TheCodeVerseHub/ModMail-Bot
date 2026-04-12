@@ -14,8 +14,11 @@ from datetime import datetime, timedelta
 import logging
 import random
 import io
+from typing import TypeVar, Callable, Awaitable, cast
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar('T')
 
 
 
@@ -43,7 +46,7 @@ class ModMail(commands.Cog):
         # DM confirmation state:
         # When a user DMs without an active session, we ask them to confirm
         # before creating a new modmail thread.
-        # { user_id: { 'created_at': iso, 'messages': [ {content, attachments, created_at} ] } }
+        # { user_id: { 'created_at': iso, 'prompt_message_id': int, 'messages': [ {content, attachments, created_at} ] } }
         self._pending_confirmations: Dict[int, Dict[str, Any]] = {}
 
         # Limits for queued messages while awaiting confirmation.
@@ -57,17 +60,6 @@ class ModMail(commands.Cog):
         except Exception:
             value = 300
         return max(30, value)
-
-    def _parse_confirmation(self, content: str) -> Optional[bool]:
-        text = (content or '').strip().lower()
-        if not text:
-            return None
-        first = text.split()[0]
-        if first in {"yes", "y", "yeah", "yep", "sure", "ok", "okay", "confirm"}:
-            return True
-        if first in {"no", "n", "nope", "nah", "cancel", "stop"}:
-            return False
-        return None
 
     def _pending_is_expired(self, pending: Dict[str, Any]) -> bool:
         created_at = pending.get('created_at')
@@ -152,18 +144,104 @@ class ModMail(commands.Cog):
             files.append(discord.File(bio, filename=filename))
         return files, had_skipped
 
-    async def _send_modmail_confirmation_prompt(self, user: Union[discord.User, discord.Member]):
-        await self._send_dm_safe(
+    async def _send_modmail_confirmation_prompt(self, user: Union[discord.User, discord.Member]) -> discord.Message:
+        prompt = await self._send_dm_safe(
             user,
             embed=discord.Embed(
                 title="Start ModMail?",
                 description=(
                     "I can open a ModMail thread so moderators can see your messages.\n\n"
-                    "Reply with **yes** to start, or **no** to cancel."
+                    "React with ✅ to start, or ❌ to cancel."
                 ),
                 color=discord.Color.blurple(),
             ),
         )
+        try:
+            await prompt.add_reaction("✅")
+            await prompt.add_reaction("❌")
+        except Exception:
+            # Best-effort; if reactions fail, user can DM again.
+            logger.exception("modmail: failed to add reactions to confirmation prompt")
+        return prompt
+
+    async def _cancel_pending_confirmation(self, user: Union[discord.User, discord.Member]):
+        self._pending_confirmations.pop(user.id, None)
+        await self._send_dm_safe(
+            user,
+            content="Okay — I won’t start a modmail thread. If you change your mind, DM me again.",
+        )
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        # Reaction-based confirmation only applies in DMs
+        if payload.user_id == getattr(self.bot.user, 'id', None):
+            return
+
+        if payload.guild_id is not None:
+            return
+
+        user_id = int(payload.user_id)
+        pending = self._pending_confirmations.get(user_id)
+        if not pending:
+            return
+
+        if self._pending_is_expired(pending):
+            self._pending_confirmations.pop(user_id, None)
+            return
+
+        prompt_message_id = pending.get('prompt_message_id')
+        if not prompt_message_id or int(prompt_message_id) != int(payload.message_id):
+            return
+
+        emoji = str(payload.emoji)
+        if emoji not in {"✅", "❌"}:
+            return
+
+        if user_id not in self._user_locks:
+            self._user_locks[user_id] = asyncio.Lock()
+
+        async with self._user_locks[user_id]:
+            # Re-check within lock
+            pending = self._pending_confirmations.get(user_id)
+            if not pending:
+                return
+            if self._pending_is_expired(pending):
+                self._pending_confirmations.pop(user_id, None)
+                return
+            if int(pending.get('prompt_message_id') or 0) != int(payload.message_id):
+                return
+
+            if emoji == "❌":
+                user = self.bot.get_user(user_id) or await self.bot.fetch_user(user_id)
+                await self._cancel_pending_confirmation(user)
+                return
+
+            # ✅: start session and flush queued messages
+            if not self.modmail_channel_id:
+                self._pending_confirmations.pop(user_id, None)
+                return
+
+            main_channel = self.bot.get_channel(self.modmail_channel_id)
+            if not main_channel or not isinstance(main_channel, discord.TextChannel):
+                self._pending_confirmations.pop(user_id, None)
+                return
+
+            user = self.bot.get_user(user_id) or await self.bot.fetch_user(user_id)
+            webhook = await self._get_or_create_webhook(main_channel)
+
+            try:
+                await self._start_new_session_and_flush_pending(
+                    user=user,
+                    main_channel=main_channel,
+                    webhook=webhook,
+                    pending=pending,
+                )
+            except Exception:
+                logger.exception("modmail: failed to create session after reaction confirm")
+                # Keep pending so user can retry reacting.
+                return
+
+            self._pending_confirmations.pop(user_id, None)
 
     async def _start_new_session_and_flush_pending(
         self,
@@ -250,20 +328,32 @@ class ModMail(commands.Cog):
     def cog_unload(self):
         pass
 
-    async def _send_with_retry(self, send_func, *args, max_retries=3, **kwargs):
+    async def _send_with_retry(
+        self,
+        send_func: Callable[..., Awaitable[T]],
+        *args,
+        max_retries: int = 3,
+        **kwargs,
+    ) -> T:
+        last_exc: Optional[BaseException] = None
         for attempt in range(max_retries):
             try:
                 return await send_func(*args, **kwargs)
             except discord.errors.HTTPException as e:
+                last_exc = e
                 if e.status == 429 and attempt < max_retries - 1:
                     retry_after = getattr(e, 'retry_after', None) or (2 ** attempt) + random.uniform(0, 1)
                     await asyncio.sleep(retry_after)
                 else:
                     raise
-            except Exception:
+            except Exception as e:
+                last_exc = e
                 raise
+
+        # Should be unreachable, but keeps type-checkers happy.
+        raise RuntimeError("send_with_retry exhausted retries") from last_exc
     
-    async def _send_dm_safe(self, user: Union[discord.User, discord.Member], **kwargs):
+    async def _send_dm_safe(self, user: Union[discord.User, discord.Member], **kwargs) -> discord.Message:
         async with self._dm_semaphore:
             dm_channel = self._dm_channel_cache.get(user.id)
             if dm_channel is None:
@@ -274,7 +364,9 @@ class ModMail(commands.Cog):
                 dm_channel = await actual_user.create_dm()
                 self._dm_channel_cache[user.id] = dm_channel
             
-            return await self._send_with_retry(dm_channel.send, **kwargs)
+            # discord.py DMChannel.send returns discord.Message
+            result = await self._send_with_retry(dm_channel.send, **kwargs)
+            return cast(discord.Message, result)
 
     async def _get_or_create_webhook(self, channel: discord.TextChannel) -> discord.Webhook:
         if self._webhook:
@@ -415,43 +507,20 @@ class ModMail(commands.Cog):
                         self._pending_confirmations.pop(user_id, None)
                         pending = None
 
-                    decision = self._parse_confirmation(message.content)
-
                     if pending is None:
                         # First DM (or after close/expiry): queue this message and ask.
                         await self._queue_pending_message(user_id, message)
-                        await self._send_modmail_confirmation_prompt(message.author)
+                        prompt = await self._send_modmail_confirmation_prompt(message.author)
+                        self._pending_confirmations[user_id]['prompt_message_id'] = prompt.id
                         return
 
-                    # We have a pending confirmation; handle yes/no or keep queuing.
-                    if decision is True:
-                        try:
-                            await self._start_new_session_and_flush_pending(
-                                user=message.author,
-                                main_channel=main_channel,
-                                webhook=webhook,
-                                pending=pending,
-                            )
-                        except Exception as e:
-                            logger.error(f"Failed to create modmail session: {e}")
-                            await message.channel.send("An error occurred while starting the modmail session.")
-                            return
-                        self._pending_confirmations.pop(user_id, None)
-                        return
-                    elif decision is False:
-                        self._pending_confirmations.pop(user_id, None)
-                        await self._send_dm_safe(
-                            message.author,
-                            content="Okay — I won’t start a modmail thread. If you change your mind, DM me again.",
-                        )
-                        return
-                    else:
-                        await self._queue_pending_message(user_id, message)
-                        await self._send_dm_safe(
-                            message.author,
-                            content="Please reply with **yes** to start ModMail or **no** to cancel.",
-                        )
-                        return
+                    # Pending exists: queue the message and remind the user to react on the prompt.
+                    await self._queue_pending_message(user_id, message)
+                    await self._send_dm_safe(
+                        message.author,
+                        content="React on the prompt message with ✅ to start or ❌ to cancel.",
+                    )
+                    return
                 else:
                     # Continue session
                     # `thread` is guaranteed by session_active
