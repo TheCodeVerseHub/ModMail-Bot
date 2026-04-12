@@ -126,8 +126,23 @@ class ModMail(commands.Cog):
         messages.append({
             'content': message.content or '',
             'attachments': attachment_payloads,
+            'source_message_id': message.id,
+            'source_channel_id': message.channel.id,
             'created_at': datetime.utcnow().isoformat(),
         })
+
+    async def _react_dm_message_success(self, channel_id: int, message_id: int):
+        try:
+            ch = self.bot.get_channel(int(channel_id))
+            if ch is None:
+                ch = await self.bot.fetch_channel(int(channel_id))
+            if not isinstance(ch, (discord.DMChannel, discord.PartialMessageable)):
+                return
+            msg = await ch.fetch_message(int(message_id))
+            await msg.add_reaction("✅")
+        except Exception:
+            # Best-effort only.
+            return
 
     def _pending_to_discord_files(self, queued_attachments: list[dict]) -> tuple[list[discord.File], bool]:
         files: list[discord.File] = []
@@ -295,6 +310,12 @@ class ModMail(commands.Cog):
                 if files:
                     send_kwargs['files'] = files
                 await webhook.send(**send_kwargs)
+
+                # React to the original DM message once forwarded.
+                src_mid = qm.get('source_message_id')
+                src_cid = qm.get('source_channel_id')
+                if src_mid and src_cid:
+                    await self._react_dm_message_success(int(src_cid), int(src_mid))
             except Exception as e:
                 await thread.send(f"Failed to relay queued message from user: {e}")
                 raise
@@ -536,6 +557,10 @@ class ModMail(commands.Cog):
                             thread=thread,
                             files=files
                         )
+                        try:
+                            await message.add_reaction("✅")
+                        except Exception:
+                            pass
                     except Exception as e:
                          if thread is not None:
                              await thread.send(f"Failed to relay message from user: {e}")
