@@ -471,22 +471,6 @@ class ModMail(commands.Cog):
         except Exception:
             logger.exception("modmail: failed to persist sessions to file")
 
-    def _is_session_expired(self, session: Dict[str, Any]) -> bool:
-        reset_seconds = int(getattr(self.config, 'modmail_reset_seconds', 0) or 0)
-        if reset_seconds <= 0:
-            return False
-
-        last_activity = session.get('last_activity')
-        if not last_activity:
-            return False
-
-        try:
-            last_dt = datetime.fromisoformat(str(last_activity))
-        except Exception:
-            return False
-
-        return (datetime.utcnow() - last_dt) > timedelta(seconds=reset_seconds)
-
     def _is_session_closed(self, session: Dict[str, Any]) -> bool:
         state = str(session.get('state') or '').lower()
         return state in {'closed', 'resolved'}
@@ -585,7 +569,7 @@ class ModMail(commands.Cog):
                 thread: Optional[discord.Thread] = None
                 session_active = False
                 if session and isinstance(session, dict):
-                    if not self._is_session_closed(session) and not self._is_session_expired(session):
+                    if not self._is_session_closed(session):
                         thread = await self._get_thread_from_session(session, main_channel)
                         session_active = thread is not None
 
@@ -597,7 +581,7 @@ class ModMail(commands.Cog):
                         pending = None
 
                     if pending is None:
-                        # First DM (or after close/expiry): queue this message and ask.
+                        # First DM (or after explicit close): queue this message and ask.
                         await self._queue_pending_message(user_id, message)
                         prompt = await self._send_modmail_confirmation_prompt(message.author)
                         self._pending_confirmations[user_id]['prompt_message_id'] = prompt.id

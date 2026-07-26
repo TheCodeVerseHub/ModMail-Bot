@@ -7,7 +7,7 @@ A simple and efficient ModMail bot for Discord, built with `discord.py`. This bo
 - **DM to ModMail**: Users can DM the bot to open a ticket.
 - **Moderator Replies**: Moderators can reply directly from the modmail channel.
 - **Slash Commands**: Includes slash commands for managing modmail.
-- **Session Management**: Handles user sessions with timeouts and locking.
+- **Session Management**: Keeps one active thread per user until a moderator closes it.
 - **Logging**: Logs events to a file and console.
 
 ## Setup
@@ -39,7 +39,6 @@ A simple and efficient ModMail bot for Discord, built with `discord.py`. This bo
     GUILD_ID=your_guild_id
     MODMAIL_CHANNEL_ID=your_modmail_channel_id
     LOG_LEVEL=INFO
-    MODMAIL_RESET_SECONDS=600
     MODMAIL_CONFIRM_TIMEOUT_SECONDS=300
     ```
 
