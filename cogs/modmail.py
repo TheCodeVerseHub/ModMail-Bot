@@ -25,7 +25,6 @@ T = TypeVar('T')
 class ModMail(commands.Cog):
     # Session format per user_id (best-effort; older persisted schemas may exist):
     # { 'thread_id': int, 'last_activity': ISO8601 timestamp, 'state': 'open'|'closed'|'resolved' }
-    modmail_sessions: Dict[int, Dict[str, Any]] = {}
     _session_locks: Dict[int, asyncio.Lock] = {}
     SESSIONS_FILE = Path("data/modmail_sessions.json")
 
@@ -33,12 +32,15 @@ class ModMail(commands.Cog):
         self.bot = bot
         self.config = config
         self.modmail_channel_id: Optional[int] = getattr(config, 'modmail_channel_id', None)
+        self.modmail_sessions: Dict[int, Dict[str, Any]] = {}
         self._dm_semaphore: asyncio.Semaphore = asyncio.Semaphore(10) # Simultaneous DMs
         self._dm_channel_cache: Dict[int, discord.DMChannel] = {}
         self._webhook: Optional[discord.Webhook] = None
         
         # Per-user lock to ensure logical consistency
         self._user_locks: Dict[int, asyncio.Lock] = {}
+        # Reverse lookup so thread events can be resolved without scanning every session.
+        self._thread_to_user: Dict[int, int] = {}
         
         # Anti-Spam: 1 message every 2 seconds per user bucket
         self.spam_control = commands.CooldownMapping.from_cooldown(1, 2.0, commands.BucketType.user)
@@ -158,6 +160,39 @@ class ModMail(commands.Cog):
             bio = io.BytesIO(data)
             files.append(discord.File(bio, filename=filename))
         return files, had_skipped
+
+    def _register_session(self, user_id: int, session: Dict[str, Any]) -> None:
+        self.modmail_sessions[user_id] = session
+        thread_id = session.get('thread_id')
+        if thread_id is None:
+            return
+        try:
+            self._thread_to_user[int(thread_id)] = int(user_id)
+        except Exception:
+            logger.exception("modmail: failed to register thread mapping")
+
+    def _clear_session(self, user_id: int) -> None:
+        session = self.modmail_sessions.pop(user_id, None)
+        if not session:
+            return
+        thread_id = session.get('thread_id')
+        if thread_id is None:
+            return
+        try:
+            self._thread_to_user.pop(int(thread_id), None)
+        except Exception:
+            logger.exception("modmail: failed to clear thread mapping")
+
+    def _rebuild_thread_index(self) -> None:
+        self._thread_to_user.clear()
+        for user_id, session in self.modmail_sessions.items():
+            thread_id = session.get('thread_id')
+            if thread_id is None:
+                continue
+            try:
+                self._thread_to_user[int(thread_id)] = int(user_id)
+            except Exception:
+                continue
 
     async def _send_modmail_confirmation_prompt(self, user: Union[discord.User, discord.Member]) -> discord.Message:
         prompt = await self._send_dm_safe(
@@ -332,11 +367,11 @@ class ModMail(commands.Cog):
             except Exception:
                 pass
 
-        self.modmail_sessions[user_id] = {
+        self._register_session(user_id, {
             'thread_id': thread.id,
             'last_activity': datetime.utcnow().isoformat(),
             'state': 'open',
-        }
+        })
         await self._persist_sessions_to_file()
 
 
@@ -406,6 +441,7 @@ class ModMail(commands.Cog):
         if not self.SESSIONS_FILE.exists():
             return
         try:
+            self.modmail_sessions.clear()
             async with aiofiles.open(self.SESSIONS_FILE, "r", encoding="utf-8") as fh:
                 content = await fh.read()
                 if not content.strip():
@@ -420,6 +456,7 @@ class ModMail(commands.Cog):
                     self.modmail_sessions[int(k)] = v
                 except Exception:
                     logger.exception(f"modmail: failed to load session for key {k}")
+            self._rebuild_thread_index()
         except Exception:
             logger.exception("modmail: error reading sessions file")
 
@@ -454,7 +491,7 @@ class ModMail(commands.Cog):
         state = str(session.get('state') or '').lower()
         return state in {'closed', 'resolved'}
 
-    def _get_thread_from_session(
+    async def _get_thread_from_session(
         self,
         session: Dict[str, Any],
         main_channel: discord.TextChannel,
@@ -463,14 +500,45 @@ class ModMail(commands.Cog):
         if not thread_id:
             return None
         try:
-            thread = main_channel.get_thread(int(thread_id))
+            thread_id_int = int(thread_id)
         except Exception:
             return None
+
+        # First check the parent channel cache, then the global channel cache,
+        # and finally fetch by ID so a valid open thread is not lost to a cache miss.
+        thread = main_channel.get_thread(thread_id_int)
         if not thread:
+            cached = self.bot.get_channel(thread_id_int)
+            if isinstance(cached, discord.Thread):
+                thread = cached
+        if not thread:
+            try:
+                fetched = await self.bot.fetch_channel(thread_id_int)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                return None
+            if isinstance(fetched, discord.Thread):
+                thread = fetched
+        if not thread:
+            return None
+        if getattr(thread, 'parent_id', None) not in {None, main_channel.id}:
             return None
         if getattr(thread, 'archived', False) or getattr(thread, 'locked', False):
             return None
         return thread
+
+    def _get_session_user_id_for_thread(self, thread_id: int) -> Optional[int]:
+        user_id = self._thread_to_user.get(int(thread_id))
+        if user_id is not None:
+            return user_id
+
+        for uid, data in self.modmail_sessions.items():
+            try:
+                if int(data.get('thread_id') or 0) == int(thread_id):
+                    self._thread_to_user[int(thread_id)] = int(uid)
+                    return int(uid)
+            except Exception:
+                continue
+        return None
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -518,7 +586,7 @@ class ModMail(commands.Cog):
                 session_active = False
                 if session and isinstance(session, dict):
                     if not self._is_session_closed(session) and not self._is_session_expired(session):
-                        thread = self._get_thread_from_session(session, main_channel)
+                        thread = await self._get_thread_from_session(session, main_channel)
                         session_active = thread is not None
 
                 if not session_active:
@@ -578,13 +646,9 @@ class ModMail(commands.Cog):
 
     async def handle_thread_reply(self, message: discord.Message):
         # Find user_id from thread_id
-        session_user_id = None
-        for uid, data in self.modmail_sessions.items():
-            if data.get('thread_id') == message.channel.id:
-                session_user_id = uid
-                break
+        session_user_id = self._get_session_user_id_for_thread(message.channel.id)
         
-        if not session_user_id:
+        if session_user_id is None:
             return # Not a modmail thread
 
         # Ignore commands
@@ -625,17 +689,14 @@ class ModMail(commands.Cog):
              return
 
         session_user_id = None
-        for uid, data in self.modmail_sessions.items():
-            if data.get('thread_id') == ctx.channel.id:
-                session_user_id = uid
-                break
+        session_user_id = self._get_session_user_id_for_thread(ctx.channel.id)
 
-        if not session_user_id:
+        if session_user_id is None:
             await ctx.send("This is not a active modmail thread.")
             return
 
         # Close session
-        del self.modmail_sessions[session_user_id]
+        self._clear_session(session_user_id)
         await self._persist_sessions_to_file()
         
         user = self.bot.get_user(session_user_id)
